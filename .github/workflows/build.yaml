@@ -1,126 +1,135 @@
-name: CHIP wheels build
+name: CHIP wheels build 32 bit
 
-on: push
+on: [push, workflow_dispatch]
 
 jobs:
-    build_prepare:
-        name: Prepare build
-        runs-on: ubuntu-latest
-        outputs:
-            version: ${{ steps.version.outputs.version }}
-            channel: ${{ steps.version.outputs.channel }}
-        steps:
-            - name: Checkout build repository
-              uses: actions/checkout@v3
-              with:
-                fetch-depth: 0
-            - name: Get version
-              id: version
-              uses: home-assistant/actions/helpers/version@master
 
-    build_linux_python_lib:
-        name: Build Python wheels for Linux (${{ matrix.arch.name }})
-        needs: build_prepare
+  build_prepare:
+    name: Prepare build
+    runs-on: ubuntu-latest
+    outputs:
+        version: ${{ steps.version.outputs.version }}
+        channel: ${{ steps.version.outputs.channel }}
+    steps:
+        - name: Checkout build repository
+          uses: actions/checkout@v3
+          with:
+            fetch-depth: 0
+        - name: Get version
+          id: version
+          uses: home-assistant/actions/helpers/version@master
 
-        strategy:
-            matrix:
-                arch:
-                    - name: x86_64
-                      container: connectedhomeip/chip-build:0.5.99
-                      runner: ubuntu-22.04
-                    - name: aarch64
-                      container: agners/aarch64-chip-build:0.5.99
-                      runner: ARM64
+  build:
+    name: Build Python wheels for Linux (${{ matrix.arch.name }})
+    needs: build_prepare
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [armv6l, armv7l, aarch64]
+        include:
+        #- arch: armv6l
+        #  cpu: arm1176
+        #  base_image: raspios_lite:latest
+        #  cpu_info: raspberrypi_zero_w
+        - arch: armv7l
+          cpu: cortex-a7
+          base_image: raspios_lite:latest
+          cpu_info: raspberrypi_3b
+        #- arch: aarch64
+        #  cpu: cortex-a53
+        #  base_image: raspios_lite_arm64:latest
+        #  cpu_info: raspberrypi_zero2_w_arm64_w
+    steps:
+    - uses: pguyot/arm-runner-action@v2
+      with:
+        base_image: ${{ matrix.base_image }}
+        cpu: ${{ matrix.cpu }}
+        cpu_info: ${{ matrix.cpu_info }}
+        commands: |
+            test `uname -m` = ${{ matrix.arch }}
+            grep Model /proc/cpuinfo
 
-        runs-on: ${{ matrix.arch.runner }}
-        permissions:
-            contents: write  # for actions/upload-release-asset to upload release asset
 
-        defaults:
-            run:
-                working-directory: ./project-chip
+    - name: Dump GitHub context
+      env:
+          GITHUB_CONTEXT: ${{ toJSON(github) }}
+      run: echo "$GITHUB_CONTEXT"
+      working-directory: ./
+    - name: Checkout build repository
+      uses: actions/checkout@v3
+    - name: Checkout CHIP SDK repository
+      uses: actions/checkout@v3
+      with:
+          repository: project-chip/connectedhomeip
+          ref: 47448899e3836cbc48688f3f5c84054d33307643
+          path: ./project-chip
+    - name: Checkout submodules
+      run: scripts/checkout_submodules.py --shallow --platform linux
+    - name: Apply patches
+      run: |
+          patch -p1 < ../0001-fix-platform-specific-wheel-to-be-spec-compliant.patch
+          patch -p1 < ../0002-Bump-setuptools-to-65.6.0.patch
+          patch -p1 < ../0003-remove-unused-python-dbus-23564.patch
+          patch -p1 < ../0004-python-allow-to-customize-wheel-package-name-and-ver.patch
+          patch -p1 < ../0005-Support-custom-platform-tag.patch
+          patch -p1 < ../0006-Revert-Python-dependencies.patch
+          patch -p1 < ../0007-Use-data-as-platform-storage-location.patch
+    - name: Bootstrap
+      run: scripts/build/gn_bootstrap.sh
+    - name: Setup Build, Run Build and Run Tests
+      run: |
+          scripts/build/gn_gen.sh --args=" \
+                                          enable_rtti=true \
+                                          enable_pylib=true \
+                                          chip_config_memory_debug_checks=false \
+                                          chip_config_memory_debug_dmalloc=false \
+                                          chip_mdns=\"minimal\" \
+                                          chip_python_version=\"${{ needs.build_prepare.outputs.version }}\"  \
+                                          chip_python_package_prefix=\"home-assistant-chip\" \
+                                          chip_python_platform_tag=\"manylinux_2_31\" \
+                                          "
+          scripts/run_in_build_env.sh "ninja -C ./out chip-repl"
+    - name: Run Python library specific unit tests
+      run: |
+          scripts/run_in_build_env.sh 'pip3 install ./out/controller/python/home_assistant_chip_core-${{ needs.build_prepare.outputs.version }}-cp37-abi3-manylinux_2_31_${{ matrix.arch.name }}.whl'
+          scripts/run_in_build_env.sh 'pip3 install ./out/controller/python/home_assistant_chip_clusters-${{ needs.build_prepare.outputs.version }}-py3-none-any.whl'
+          scripts/run_in_build_env.sh 'pip3 install ./out/controller/python/home_assistant_chip_repl-${{ needs.build_prepare.outputs.version }}-py3-none-any.whl'
+          scripts/run_in_build_env.sh '(cd src/controller/python/test/unit_tests/ && python3 -m unittest -v)'
+    - name: Upload wheels as artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: chip-wheels
+        path: project-chip/out/controller/python/*.whl
+    - name: Upload wheels as release assets
+      uses: softprops/action-gh-release@v1
+      if: startsWith(github.ref, 'refs/tags/')
+      with:
+        files: project-chip/out/controller/python/*.whl
+    - name: Upload wheels to PyPI
+      if: startsWith(github.ref, 'refs/tags/')
+      env:
+          TWINE_USERNAME: "__token__"
+          TWINE_PASSWORD: ${{ secrets.TWINE_TOKEN_PYPI }}
+          TWINE_REPOSITORY: "pypi"
+      run: |
+          python3 -m pip install twine build
+          python3 -m twine upload out/controller/python/home_assistant_chip_clusters-${{ needs.build_prepare.outputs.version }}-py3-none-any.whl --skip-existing
+          python3 -m twine upload out/controller/python/home_assistant_chip_core-${{ needs.build_prepare.outputs.version }}-cp37-abi3-manylinux_2_31_${{ matrix.arch.name }}.whl --skip-existing
+          python3 -m twine upload out/controller/python/home_assistant_chip_repl-${{ needs.build_prepare.outputs.version }}-py3-none-any.whl --skip-existing
+    - name: Upload wheels to Test PyPI
+      env:
+          TWINE_USERNAME: "__token__"
+          TWINE_PASSWORD: ${{ secrets.TWINE_TOKEN_TESTPYPI }}
+          TWINE_REPOSITORY: "testpypi"
+      run: |
+          python3 -m pip install twine build
+          python3 -m twine upload out/controller/python/home_assistant_chip_clusters-${{ needs.build_prepare.outputs.version }}-py3-none-any.whl --skip-existing
+          python3 -m twine upload out/controller/python/home_assistant_chip_core-${{ needs.build_prepare.outputs.version }}-cp37-abi3-manylinux_2_31_${{ matrix.arch.name }}.whl --skip-existing
+          python3 -m twine upload out/controller/python/home_assistant_chip_repl-${{ needs.build_prepare.outputs.version }}-py3-none-any.whl --skip-existing
 
-        container:
-            image: ${{ matrix.arch.container }}
-            volumes:
-                - "/tmp/log_output:/tmp/test_logs"
-            options: --sysctl "net.ipv6.conf.all.disable_ipv6=0
-                net.ipv4.conf.all.forwarding=1 net.ipv6.conf.all.forwarding=1"
 
-        steps:
-            - name: Dump GitHub context
-              env:
-                  GITHUB_CONTEXT: ${{ toJSON(github) }}
-              run: echo "$GITHUB_CONTEXT"
-              working-directory: ./
-            - name: Checkout build repository
-              uses: actions/checkout@v3
-            - name: Checkout CHIP SDK repository
-              uses: actions/checkout@v3
-              with:
-                  repository: project-chip/connectedhomeip
-                  ref: 47448899e3836cbc48688f3f5c84054d33307643
-                  path: ./project-chip
-            - name: Checkout submodules
-              run: scripts/checkout_submodules.py --shallow --platform linux
-            - name: Apply patches
-              run: |
-                  patch -p1 < ../0001-fix-platform-specific-wheel-to-be-spec-compliant.patch
-                  patch -p1 < ../0002-Bump-setuptools-to-65.6.0.patch
-                  patch -p1 < ../0003-remove-unused-python-dbus-23564.patch
-                  patch -p1 < ../0004-python-allow-to-customize-wheel-package-name-and-ver.patch
-                  patch -p1 < ../0005-Support-custom-platform-tag.patch
-                  patch -p1 < ../0006-Revert-Python-dependencies.patch
-                  patch -p1 < ../0007-Use-data-as-platform-storage-location.patch
-            - name: Bootstrap
-              run: scripts/build/gn_bootstrap.sh
-            - name: Setup Build, Run Build and Run Tests
-              run: |
-                  scripts/build/gn_gen.sh --args=" \
-                                                  enable_rtti=true \
-                                                  enable_pylib=true \
-                                                  chip_config_memory_debug_checks=false \
-                                                  chip_config_memory_debug_dmalloc=false \
-                                                  chip_mdns=\"minimal\" \
-                                                  chip_python_version=\"${{ needs.build_prepare.outputs.version }}\"  \
-                                                  chip_python_package_prefix=\"home-assistant-chip\" \
-                                                  chip_python_platform_tag=\"manylinux_2_31\" \
-                                                  "
-                  scripts/run_in_build_env.sh "ninja -C ./out chip-repl"
-            - name: Run Python library specific unit tests
-              run: |
-                  scripts/run_in_build_env.sh 'pip3 install ./out/controller/python/home_assistant_chip_core-${{ needs.build_prepare.outputs.version }}-cp37-abi3-manylinux_2_31_${{ matrix.arch.name }}.whl'
-                  scripts/run_in_build_env.sh 'pip3 install ./out/controller/python/home_assistant_chip_clusters-${{ needs.build_prepare.outputs.version }}-py3-none-any.whl'
-                  scripts/run_in_build_env.sh 'pip3 install ./out/controller/python/home_assistant_chip_repl-${{ needs.build_prepare.outputs.version }}-py3-none-any.whl'
-                  scripts/run_in_build_env.sh '(cd src/controller/python/test/unit_tests/ && python3 -m unittest -v)'
-            - name: Upload wheels as artifacts
-              uses: actions/upload-artifact@v3
-              with:
-                name: chip-wheels
-                path: project-chip/out/controller/python/*.whl
-            - name: Upload wheels as release assets
-              uses: softprops/action-gh-release@v1
-              if: startsWith(github.ref, 'refs/tags/')
-              with:
-                files: project-chip/out/controller/python/*.whl
-            - name: Upload wheels to PyPI
-              if: startsWith(github.ref, 'refs/tags/')
-              env:
-                  TWINE_USERNAME: "__token__"
-                  TWINE_PASSWORD: ${{ secrets.TWINE_TOKEN_PYPI }}
-                  TWINE_REPOSITORY: "pypi"
-              run: |
-                  python3 -m pip install twine build
-                  python3 -m twine upload out/controller/python/home_assistant_chip_clusters-${{ needs.build_prepare.outputs.version }}-py3-none-any.whl --skip-existing
-                  python3 -m twine upload out/controller/python/home_assistant_chip_core-${{ needs.build_prepare.outputs.version }}-cp37-abi3-manylinux_2_31_${{ matrix.arch.name }}.whl --skip-existing
-                  python3 -m twine upload out/controller/python/home_assistant_chip_repl-${{ needs.build_prepare.outputs.version }}-py3-none-any.whl --skip-existing
-            - name: Upload wheels to Test PyPI
-              env:
-                  TWINE_USERNAME: "__token__"
-                  TWINE_PASSWORD: ${{ secrets.TWINE_TOKEN_TESTPYPI }}
-                  TWINE_REPOSITORY: "testpypi"
-              run: |
-                  python3 -m pip install twine build
-                  python3 -m twine upload out/controller/python/home_assistant_chip_clusters-${{ needs.build_prepare.outputs.version }}-py3-none-any.whl --skip-existing
-                  python3 -m twine upload out/controller/python/home_assistant_chip_core-${{ needs.build_prepare.outputs.version }}-cp37-abi3-manylinux_2_31_${{ matrix.arch.name }}.whl --skip-existing
-                  python3 -m twine upload out/controller/python/home_assistant_chip_repl-${{ needs.build_prepare.outputs.version }}-py3-none-any.whl --skip-existing
+
+
+
+
+
